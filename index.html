@@ -22,13 +22,13 @@
       z-index: 1;
     }
 
-    /* Dual Crossfade Layers (A/B Double Buffering) */
+    /* Dual Crossfade Layers */
     .slide-layer {
       position: absolute; top: 0; left: 0;
       width: 100vw; height: 100vh;
       background-repeat: no-repeat;
       opacity: 0;
-      will-change: opacity, background-image;
+      will-change: opacity;
       z-index: 2;
     }
 
@@ -52,8 +52,6 @@
       background-position: -200vw 0;
     }
 
-    .visible { opacity: 1 !important; }
-
     #status-overlay {
       position: fixed; top: 15px; left: 15px;
       color: #00ff66; font-family: monospace; font-size: 14px;
@@ -64,7 +62,6 @@
 </head>
 <body class="mode-span" data-screen="1">
   <div id="status-overlay">Waiting for Controller...</div>
-  <!-- Layer A and Layer B for seamless crossfading -->
   <div id="slide-a" class="slide-layer"></div>
   <div id="slide-b" class="slide-layer"></div>
   <video id="player" preload="auto" muted playsinline></video>
@@ -72,15 +69,18 @@
   <script>
     const statusEl = document.getElementById('status-overlay');
     const video = document.getElementById('player');
-    const layerA = document.getElementById('slide-a');
-    const layerB = document.getElementById('slide-b');
+    const layers = [
+      document.getElementById('slide-a'),
+      document.getElementById('slide-b')
+    ];
     
     let screenIndex = 1;
     let ws = null;
     let serverHost = "";
-    let activeLayer = 'a'; // Alternates between 'a' and 'b'
+    let currentLayerIndex = 0;
     const imageCache = new Map();
 
+    // 1. CONFIGURE CAST RECEIVER CONTEXT (DISABLE ALL TIMEOUTS)
     const context = cast.framework.CastReceiverContext.getInstance();
     const CUSTOM_CHANNEL = 'urn:x-cast:com.church.videowall';
 
@@ -93,7 +93,12 @@
       connectToLocalMac(serverHost);
     });
 
-    context.start();
+    // --- CRITICAL: Keep connection alive forever ---
+    const options = new cast.framework.CastReceiverOptions();
+    options.disableIdleTimeout = true;      // Prevents the 5-minute auto-close
+    options.maxInactivity = 86400;           // Keeps session alive for 24 hours
+    options.skipPlayersLoad = true;          // Optimizes memory for custom web display
+    context.start(options);
 
     function preloadImage(url) {
       if (imageCache.has(url)) return imageCache.get(url);
@@ -110,46 +115,44 @@
       ws.onmessage = async (event) => {
         const msg = JSON.parse(event.data);
 
-        // Pre-cache all slide images in memory
         if (msg.type === 'preload-slides' && Array.isArray(msg.slideUrls)) {
           msg.slideUrls.forEach(url => preloadImage(`http://${host}${url}`));
           return;
         }
 
-        // --- SHOW IMAGE WITH DUAL-LAYER CROSSFADE ---
+        // --- SHOW IMAGE WITH PARALLEL CROSSFADE ---
         if (msg.type === 'show-slide') {
           document.body.className = msg.layout === 'tile' ? 'mode-tile' : 'mode-span';
           const fullImgUrl = `http://${host}${msg.slideUrl}`;
-          const fadeDuration = msg.fadeDuration !== undefined ? msg.fadeDuration : 1.0;
+          const fadeDuration = parseFloat(msg.fadeDuration !== undefined ? msg.fadeDuration : 1.0);
 
-          // Decode image before transition
           const imgObj = preloadImage(fullImgUrl);
           if (imgObj.decode) {
             try { await imgObj.decode(); } catch(e) {}
           }
 
-          // A/B Layer Dissolve Logic
-          const currentVisible = activeLayer === 'a' ? layerA : layerB;
-          const nextVisible = activeLayer === 'a' ? layerB : layerA;
+          const incomingIndex = 1 - currentLayerIndex;
+          const incoming = layers[incomingIndex];
+          const outgoing = layers[currentLayerIndex];
 
-          // Set fade duration dynamically
-          nextVisible.style.transition = `opacity ${fadeDuration}s ease-in-out`;
-          currentVisible.style.transition = `opacity ${fadeDuration}s ease-in-out`;
+          incoming.style.transition = 'none';
+          incoming.style.opacity = '0';
+          incoming.style.backgroundImage = `url('${fullImgUrl}')`;
+          incoming.style.zIndex = '3';
+          outgoing.style.zIndex = '2';
 
-          // Put next image on the incoming layer and bring it on top
-          nextVisible.style.backgroundImage = `url('${fullImgUrl}')`;
-          nextVisible.style.zIndex = 3;
-          currentVisible.style.zIndex = 2;
+          void incoming.offsetWidth; // Force reflow
 
-          // Crossfade
-          nextVisible.classList.add('visible');
+          const transitionCss = `opacity ${fadeDuration}s cubic-bezier(0.4, 0.0, 0.2, 1)`;
+          incoming.style.transition = transitionCss;
+          outgoing.style.transition = transitionCss;
 
-          setTimeout(() => {
-            currentVisible.classList.remove('visible');
-            activeLayer = activeLayer === 'a' ? 'b' : 'a';
-          }, (fadeDuration * 1000) + 50);
+          incoming.style.opacity = '1';
+          outgoing.style.opacity = '0';
 
-          video.classList.remove('visible');
+          currentLayerIndex = incomingIndex;
+
+          video.style.opacity = '0';
           video.pause();
 
           statusEl.textContent = `Slide: ${msg.title || ''} (${msg.layout.toUpperCase()})`;
@@ -157,9 +160,9 @@
 
         // --- PLAY VIDEO WALL LOOP ---
         if (msg.type === 'play-video') {
-          layerA.classList.remove('visible');
-          layerB.classList.remove('visible');
-          video.classList.add('visible');
+          layers[0].style.opacity = '0';
+          layers[1].style.opacity = '0';
+          video.style.opacity = '1';
           video.src = `http://${host}/screen${screenIndex}.mp4`;
           video.play().then(() => {
             statusEl.textContent = `Playing Video Wall`;
@@ -168,9 +171,9 @@
 
         // --- BLACKOUT ---
         if (msg.type === 'blackout') {
-          layerA.classList.remove('visible');
-          layerB.classList.remove('visible');
-          video.classList.remove('visible');
+          layers[0].style.opacity = '0';
+          layers[1].style.opacity = '0';
+          video.style.opacity = '0';
           video.pause();
           statusEl.textContent = `Blackout`;
         }
