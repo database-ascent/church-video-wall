@@ -5,6 +5,11 @@
   <title>Vizio Wall Cast Receiver</title>
   <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <style>
+    :root {
+      --bezel-gap: 2vw; /* Default 2% bezel gap */
+      --total-width: calc(300vw + (2 * var(--bezel-gap)));
+    }
+
     * { box-sizing: border-box; }
     html, body {
       margin: 0; padding: 0;
@@ -28,28 +33,28 @@
       width: 100vw; height: 100vh;
       background-repeat: no-repeat;
       opacity: 0;
-      will-change: opacity;
+      will-change: opacity, background-position;
       z-index: 2;
     }
 
     /* TILE MODE: Show full image centered on each TV */
     body.mode-tile .slide-layer {
       background-size: contain;
-      background-position: center center;
+      background-position: center center !important;
     }
 
-    /* SPAN MODE: Slice image across all 3 TVs */
+    /* SPAN MODE: Slice image with dynamic bezel math */
+    body.mode-span .slide-layer {
+      background-size: var(--total-width) 100vh;
+    }
     body.mode-span[data-screen="1"] .slide-layer {
-      background-size: 300vw 100vh;
       background-position: 0vw 0;
     }
     body.mode-span[data-screen="2"] .slide-layer {
-      background-size: 300vw 100vh;
-      background-position: -100vw 0;
+      background-position: calc(-100vw - var(--bezel-gap)) 0;
     }
     body.mode-span[data-screen="3"] .slide-layer {
-      background-size: 300vw 100vh;
-      background-position: -200vw 0;
+      background-position: calc(-200vw - (2 * var(--bezel-gap))) 0;
     }
 
     #status-overlay {
@@ -80,7 +85,6 @@
     let currentLayerIndex = 0;
     const imageCache = new Map();
 
-    // 1. CONFIGURE CAST RECEIVER CONTEXT (DISABLE ALL TIMEOUTS)
     const context = cast.framework.CastReceiverContext.getInstance();
     const CUSTOM_CHANNEL = 'urn:x-cast:com.church.videowall';
 
@@ -93,11 +97,10 @@
       connectToLocalMac(serverHost);
     });
 
-    // --- CRITICAL: Keep connection alive forever ---
     const options = new cast.framework.CastReceiverOptions();
-    options.disableIdleTimeout = true;      // Prevents the 5-minute auto-close
-    options.maxInactivity = 86400;           // Keeps session alive for 24 hours
-    options.skipPlayersLoad = true;          // Optimizes memory for custom web display
+    options.disableIdleTimeout = true;
+    options.maxInactivity = 86400;
+    options.skipPlayersLoad = true;
     context.start(options);
 
     function preloadImage(url) {
@@ -114,6 +117,13 @@
 
       ws.onmessage = async (event) => {
         const msg = JSON.parse(event.data);
+
+        // --- REAL-TIME BEZEL ADJUSTMENT ---
+        if (msg.type === 'bezel-config') {
+          const bezelVal = parseFloat(msg.bezel || 2.0);
+          document.documentElement.style.setProperty('--bezel-gap', `${bezelVal}vw`);
+          return;
+        }
 
         if (msg.type === 'preload-slides' && Array.isArray(msg.slideUrls)) {
           msg.slideUrls.forEach(url => preloadImage(`http://${host}${url}`));
@@ -141,7 +151,7 @@
           incoming.style.zIndex = '3';
           outgoing.style.zIndex = '2';
 
-          void incoming.offsetWidth; // Force reflow
+          void incoming.offsetWidth; // Force layout flush
 
           const transitionCss = `opacity ${fadeDuration}s cubic-bezier(0.4, 0.0, 0.2, 1)`;
           incoming.style.transition = transitionCss;
