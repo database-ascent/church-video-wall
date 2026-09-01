@@ -18,7 +18,7 @@
       width: 100vw; height: 100vh;
       object-fit: cover;
       opacity: 0;
-      transition: opacity 0.4s ease-in-out;
+      transition: opacity 0.3s ease-in-out;
       z-index: 1;
     }
 
@@ -27,11 +27,12 @@
       width: 100vw; height: 100vh;
       background-repeat: no-repeat;
       opacity: 0;
-      transition: opacity 0.4s ease-in-out, background-position 0.2s;
+      transition: opacity 0.3s ease-in-out;
+      will-change: opacity, background-image;
       z-index: 2;
     }
 
-    /* TILE MODE: Full image centered on each TV */
+    /* TILE MODE: Show full image centered on each TV */
     body.mode-tile #slide-layer {
       background-size: contain;
       background-position: center center;
@@ -74,6 +75,7 @@
     let screenIndex = 1;
     let ws = null;
     let serverHost = "";
+    const imageCache = new Map(); // In-memory image cache
 
     const context = cast.framework.CastReceiverContext.getInstance();
     const CUSTOM_CHANNEL = 'urn:x-cast:com.church.videowall';
@@ -81,7 +83,7 @@
     context.addCustomMessageListener(CUSTOM_CHANNEL, (event) => {
       screenIndex = event.data.screen;
       document.body.setAttribute('data-screen', screenIndex);
-      serverHost = event.data.serverIp; // e.g. "192.168.1.99:3000"
+      serverHost = event.data.serverIp;
       
       statusEl.textContent = `Screen ${screenIndex} Ready`;
       connectToLocalMac(serverHost);
@@ -89,25 +91,49 @@
 
     context.start();
 
+    // Preload an image into memory and GPU buffer
+    function preloadImage(url) {
+      if (imageCache.has(url)) return imageCache.get(url);
+      const img = new Image();
+      img.src = url;
+      if (img.decode) {
+        img.decode().catch(() => {}); // Decode offscreen in background thread
+      }
+      imageCache.set(url, img);
+      return img;
+    }
+
     function connectToLocalMac(host) {
       ws = new WebSocket(`ws://${host}`);
 
-      ws.onmessage = (event) => {
+      ws.onmessage = async (event) => {
         const msg = JSON.parse(event.data);
 
-        // --- SHOW IMAGE / SLIDE ---
+        // --- PRELOAD ENTIRE SLIDE DECK IN ADVANCE ---
+        if (msg.type === 'preload-slides' && Array.isArray(msg.slideUrls)) {
+          msg.slideUrls.forEach(url => preloadImage(`http://${host}${url}`));
+          return;
+        }
+
+        // --- SHOW IMAGE / SLIDE (INSTANT SWAP) ---
         if (msg.type === 'show-slide') {
           document.body.className = msg.layout === 'tile' ? 'mode-tile' : 'mode-span';
-          
-          // Construct full URL using Mac's real IP address
           const fullImgUrl = `http://${host}${msg.slideUrl}`;
+
+          // Preload & Decode before displaying to guarantee 0ms jank
+          const imgObj = preloadImage(fullImgUrl);
+          
+          if (imgObj.decode) {
+            try { await imgObj.decode(); } catch(e) {}
+          }
+
           slideLayer.style.backgroundImage = `url('${fullImgUrl}')`;
           slideLayer.classList.add('visible');
           
           video.classList.remove('visible');
           video.pause();
 
-          statusEl.textContent = `Image: ${msg.title || 'Slide'} (${msg.layout.toUpperCase()})`;
+          statusEl.textContent = `Slide: ${msg.title || ''} (${msg.layout.toUpperCase()})`;
         }
 
         // --- PLAY VIDEO WALL LOOP ---
