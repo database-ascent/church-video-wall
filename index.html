@@ -5,11 +5,6 @@
   <title>Vizio Wall Cast Receiver</title>
   <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <style>
-    :root {
-      --bezel-gap: 2vw; /* Default 2% bezel gap */
-      --total-width: calc(300vw + (2 * var(--bezel-gap)));
-    }
-
     * { box-sizing: border-box; }
     html, body {
       margin: 0; padding: 0;
@@ -33,28 +28,8 @@
       width: 100vw; height: 100vh;
       background-repeat: no-repeat;
       opacity: 0;
-      will-change: opacity, background-position;
+      will-change: opacity, background-position, background-size;
       z-index: 2;
-    }
-
-    /* TILE MODE: Show full image centered on each TV */
-    body.mode-tile .slide-layer {
-      background-size: contain;
-      background-position: center center !important;
-    }
-
-    /* SPAN MODE: Slice image with dynamic bezel math */
-    body.mode-span .slide-layer {
-      background-size: var(--total-width) 100vh;
-    }
-    body.mode-span[data-screen="1"] .slide-layer {
-      background-position: 0vw 0;
-    }
-    body.mode-span[data-screen="2"] .slide-layer {
-      background-position: calc(-100vw - var(--bezel-gap)) 0;
-    }
-    body.mode-span[data-screen="3"] .slide-layer {
-      background-position: calc(-200vw - (2 * var(--bezel-gap))) 0;
     }
 
     #status-overlay {
@@ -65,7 +40,7 @@
     }
   </style>
 </head>
-<body class="mode-span" data-screen="1">
+<body>
   <div id="status-overlay">Waiting for Controller...</div>
   <div id="slide-a" class="slide-layer"></div>
   <div id="slide-b" class="slide-layer"></div>
@@ -82,6 +57,8 @@
     let screenIndex = 1;
     let ws = null;
     let serverHost = "";
+    let currentBezel = 2.0;
+    let currentLayout = 'span';
     let currentLayerIndex = 0;
     const imageCache = new Map();
 
@@ -90,9 +67,10 @@
 
     context.addCustomMessageListener(CUSTOM_CHANNEL, (event) => {
       screenIndex = event.data.screen;
-      document.body.setAttribute('data-screen', screenIndex);
       serverHost = event.data.serverIp;
+      currentBezel = parseFloat(event.data.bezel || 2.0);
       
+      applyGeometry();
       statusEl.textContent = `Screen ${screenIndex} Ready`;
       connectToLocalMac(serverHost);
     });
@@ -102,6 +80,23 @@
     options.maxInactivity = 86400;
     options.skipPlayersLoad = true;
     context.start(options);
+
+    // DIRECT JAVASCRIPT BEZEL & LAYOUT GEOMETRY ENGINE
+    function applyGeometry() {
+      const isSpan = (currentLayout === 'span');
+      const totalWidthVw = 300 + (2 * currentBezel);
+      const leftOffsetVw = -((screenIndex - 1) * (100 + currentBezel));
+
+      layers.forEach(layer => {
+        if (isSpan) {
+          layer.style.backgroundSize = `${totalWidthVw}vw 100vh`;
+          layer.style.backgroundPosition = `${leftOffsetVw}vw 0px`;
+        } else {
+          layer.style.backgroundSize = 'contain';
+          layer.style.backgroundPosition = 'center center';
+        }
+      });
+    }
 
     function preloadImage(url) {
       if (imageCache.has(url)) return imageCache.get(url);
@@ -120,8 +115,16 @@
 
         // --- REAL-TIME BEZEL ADJUSTMENT ---
         if (msg.type === 'bezel-config') {
-          const bezelVal = parseFloat(msg.bezel || 2.0);
-          document.documentElement.style.setProperty('--bezel-gap', `${bezelVal}vw`);
+          currentBezel = parseFloat(msg.bezel || 2.0);
+          applyGeometry();
+          statusEl.textContent = `Screen ${screenIndex} (Bezel: ${currentBezel}%)`;
+          return;
+        }
+
+        // --- KILL CAST COMMAND ---
+        if (msg.type === 'kill-cast') {
+          statusEl.textContent = "Closing Cast...";
+          setTimeout(() => { context.stop(); }, 500);
           return;
         }
 
@@ -132,7 +135,9 @@
 
         // --- SHOW IMAGE WITH PARALLEL CROSSFADE ---
         if (msg.type === 'show-slide') {
-          document.body.className = msg.layout === 'tile' ? 'mode-tile' : 'mode-span';
+          currentLayout = msg.layout || 'span';
+          applyGeometry();
+
           const fullImgUrl = `http://${host}${msg.slideUrl}`;
           const fadeDuration = parseFloat(msg.fadeDuration !== undefined ? msg.fadeDuration : 1.0);
 
@@ -151,7 +156,7 @@
           incoming.style.zIndex = '3';
           outgoing.style.zIndex = '2';
 
-          void incoming.offsetWidth; // Force layout flush
+          void incoming.offsetWidth; // Layout flush
 
           const transitionCss = `opacity ${fadeDuration}s cubic-bezier(0.4, 0.0, 0.2, 1)`;
           incoming.style.transition = transitionCss;
@@ -165,7 +170,7 @@
           video.style.opacity = '0';
           video.pause();
 
-          statusEl.textContent = `Slide: ${msg.title || ''} (${msg.layout.toUpperCase()})`;
+          statusEl.textContent = `Slide: ${msg.title || ''} (${currentLayout.toUpperCase()})`;
         }
 
         // --- PLAY VIDEO WALL LOOP ---
