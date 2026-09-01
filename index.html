@@ -13,7 +13,6 @@
       overflow: hidden;
     }
     
-    /* 1. Video Layer */
     video {
       position: absolute; top: 0; left: 0;
       width: 100vw; height: 100vh;
@@ -23,7 +22,6 @@
       z-index: 1;
     }
 
-    /* 2. Slide/Image Layer */
     #slide-layer {
       position: absolute; top: 0; left: 0;
       width: 100vw; height: 100vh;
@@ -33,13 +31,13 @@
       z-index: 2;
     }
 
-    /* TILE MODE: Show full image centered on each TV */
+    /* TILE MODE: Full image centered on each TV */
     body.mode-tile #slide-layer {
       background-size: contain;
       background-position: center center;
     }
 
-    /* SPAN MODE: Slice image 1/3 across each TV */
+    /* SPAN MODE: Slice image across all 3 TVs */
     body.mode-span[data-screen="1"] #slide-layer {
       background-size: 300vw 100vh;
       background-position: 0vw 0;
@@ -83,7 +81,7 @@
     context.addCustomMessageListener(CUSTOM_CHANNEL, (event) => {
       screenIndex = event.data.screen;
       document.body.setAttribute('data-screen', screenIndex);
-      serverHost = event.data.serverIp;
+      serverHost = event.data.serverIp; // e.g. "192.168.1.99:3000"
       
       statusEl.textContent = `Screen ${screenIndex} Ready`;
       connectToLocalMac(serverHost);
@@ -99,10 +97,11 @@
 
         // --- SHOW IMAGE / SLIDE ---
         if (msg.type === 'show-slide') {
-          // Set layout class ('mode-span' or 'mode-tile')
           document.body.className = msg.layout === 'tile' ? 'mode-tile' : 'mode-span';
           
-          slideLayer.style.backgroundImage = `url('${msg.imageUrl}')`;
+          // Construct full URL using Mac's real IP address
+          const fullImgUrl = `http://${host}${msg.slideUrl}`;
+          slideLayer.style.backgroundImage = `url('${fullImgUrl}')`;
           slideLayer.classList.add('visible');
           
           video.classList.remove('visible');
@@ -118,8 +117,6 @@
           video.src = `http://${host}/screen${screenIndex}.mp4`;
           video.play().then(() => {
             statusEl.textContent = `Playing Video Wall`;
-          }).catch(() => {
-            statusEl.textContent = `Autoplay blocked`;
           });
         }
 
