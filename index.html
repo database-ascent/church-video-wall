@@ -12,157 +12,125 @@
       background: #000;
       overflow: hidden;
     }
+    
+    /* 1. Video Layer */
     video {
-      width: 100vw;
-      height: 100vh;
+      position: absolute; top: 0; left: 0;
+      width: 100vw; height: 100vh;
       object-fit: cover;
+      opacity: 0;
+      transition: opacity 0.4s ease-in-out;
+      z-index: 1;
     }
+
+    /* 2. Slide/Image Layer */
+    #slide-layer {
+      position: absolute; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background-repeat: no-repeat;
+      opacity: 0;
+      transition: opacity 0.4s ease-in-out, background-position 0.2s;
+      z-index: 2;
+    }
+
+    /* TILE MODE: Show full image centered on each TV */
+    body.mode-tile #slide-layer {
+      background-size: contain;
+      background-position: center center;
+    }
+
+    /* SPAN MODE: Slice image 1/3 across each TV */
+    body.mode-span[data-screen="1"] #slide-layer {
+      background-size: 300vw 100vh;
+      background-position: 0vw 0;
+    }
+    body.mode-span[data-screen="2"] #slide-layer {
+      background-size: 300vw 100vh;
+      background-position: -100vw 0;
+    }
+    body.mode-span[data-screen="3"] #slide-layer {
+      background-size: 300vw 100vh;
+      background-position: -200vw 0;
+    }
+
+    .visible { opacity: 1 !important; }
+
     #status-overlay {
-      position: fixed;
-      top: 15px; left: 15px;
-      color: #00ff66;
-      font-family: monospace;
-      font-size: 16px;
-      background: rgba(0,0,0,0.8);
-      padding: 8px 14px;
-      border-radius: 6px;
-      z-index: 100;
+      position: fixed; top: 15px; left: 15px;
+      color: #00ff66; font-family: monospace; font-size: 14px;
+      background: rgba(0,0,0,0.8); padding: 8px 14px;
+      border-radius: 6px; z-index: 100;
     }
   </style>
 </head>
-<body>
-  <div id="status-overlay">Waiting for Mac Controller...</div>
+<body class="mode-span" data-screen="1">
+  <div id="status-overlay">Waiting for Controller...</div>
+  <div id="slide-layer"></div>
   <video id="player" preload="auto" muted playsinline></video>
 
   <script>
     const statusEl = document.getElementById('status-overlay');
     const video = document.getElementById('player');
+    const slideLayer = document.getElementById('slide-layer');
     
     let screenIndex = 1;
     let ws = null;
-    let serverClockOffset = 0;
-    let isMasterPlaying = false;
-    let masterTimelineStartEpoch = 0;
-    let launchTimer = null;
-
-    // Error diagnostics
-    video.onerror = () => {
-      const err = video.error;
-      statusEl.textContent = `Video Error: Code ${err ? err.code : 'unknown'}`;
-      statusEl.style.color = '#ef4444';
-    };
+    let serverHost = "";
 
     const context = cast.framework.CastReceiverContext.getInstance();
     const CUSTOM_CHANNEL = 'urn:x-cast:com.church.videowall';
 
     context.addCustomMessageListener(CUSTOM_CHANNEL, (event) => {
-      const config = event.data;
-      screenIndex = config.screen;
+      screenIndex = event.data.screen;
+      document.body.setAttribute('data-screen', screenIndex);
+      serverHost = event.data.serverIp;
       
-      statusEl.textContent = `Screen ${screenIndex} Initialized`;
-      connectToLocalMac(config.serverIp);
+      statusEl.textContent = `Screen ${screenIndex} Ready`;
+      connectToLocalMac(serverHost);
     });
 
     context.start();
 
-    function connectToLocalMac(serverHost) {
-      // Points each TV to its own lightweight pre-sliced 1080p stream
-      video.src = `http://${serverHost}/screen${screenIndex}.mp4`;
-      ws = new WebSocket(`ws://${serverHost}`);
-
-      ws.onopen = () => {
-        statusEl.textContent = `Screen ${screenIndex} (Calibrating...)`;
-        runClockCalibration(8);
-      };
+    function connectToLocalMac(host) {
+      ws = new WebSocket(`ws://${host}`);
 
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
 
-        if (msg.type === 'arm') {
-          if (launchTimer) clearTimeout(launchTimer);
-          isMasterPlaying = false;
-          video.playbackRate = 1.0;
+        // --- SHOW IMAGE / SLIDE ---
+        if (msg.type === 'show-slide') {
+          // Set layout class ('mode-span' or 'mode-tile')
+          document.body.className = msg.layout === 'tile' ? 'mode-tile' : 'mode-span';
+          
+          slideLayer.style.backgroundImage = `url('${msg.imageUrl}')`;
+          slideLayer.classList.add('visible');
+          
+          video.classList.remove('visible');
           video.pause();
 
-          const onSeeked = () => {
-            video.removeEventListener('seeked', onSeeked);
-            statusEl.textContent = `Screen ${screenIndex} (Armed & Ready)`;
-          };
-          video.addEventListener('seeked', onSeeked);
-          video.currentTime = msg.targetTime || 0;
+          statusEl.textContent = `Image: ${msg.title || 'Slide'} (${msg.layout.toUpperCase()})`;
         }
 
-        if (msg.type === 'fire') {
-          if (launchTimer) clearTimeout(launchTimer);
-          masterTimelineStartEpoch = msg.timelineStartEpoch;
-
-          const targetClientEpoch = msg.launchEpoch - serverClockOffset;
-          const delay = Math.max(0, targetClientEpoch - Date.now());
-
-          launchTimer = setTimeout(() => {
-            isMasterPlaying = true;
-            video.playbackRate = 1.0;
-            video.play().then(() => {
-              statusEl.textContent = `Screen ${screenIndex} (Playing ▶)`;
-            }).catch(e => {
-              statusEl.textContent = "Autoplay blocked";
-            });
-          }, delay);
+        // --- PLAY VIDEO WALL LOOP ---
+        if (msg.type === 'play-video') {
+          slideLayer.classList.remove('visible');
+          video.classList.add('visible');
+          video.src = `http://${host}/screen${screenIndex}.mp4`;
+          video.play().then(() => {
+            statusEl.textContent = `Playing Video Wall`;
+          }).catch(() => {
+            statusEl.textContent = `Autoplay blocked`;
+          });
         }
 
-        if (msg.type === 'pause') {
-          isMasterPlaying = false;
+        // --- BLACKOUT ---
+        if (msg.type === 'blackout') {
+          slideLayer.classList.remove('visible');
+          video.classList.remove('visible');
           video.pause();
-          statusEl.textContent = `Screen ${screenIndex} (Paused ⏸)`;
-        }
-
-        if (msg.type === 'heartbeat' && isMasterPlaying) {
-          masterTimelineStartEpoch = msg.timelineStartEpoch;
-          smoothDriftSync();
+          statusEl.textContent = `Blackout`;
         }
       };
-    }
-
-    function runClockCalibration(roundsLeft) {
-      if (roundsLeft <= 0) {
-        statusEl.textContent = `Screen ${screenIndex} (Ready)`;
-        return;
-      }
-      const clientSend = Date.now();
-      const handler = (e) => {
-        const msg = JSON.parse(e.data);
-        if (msg.type === 'sync-pong') {
-          const now = Date.now();
-          const rtt = now - clientSend;
-          serverClockOffset = (msg.serverTime + (rtt / 2)) - now;
-          ws.removeEventListener('message', handler);
-          setTimeout(() => runClockCalibration(roundsLeft - 1), 30);
-        }
-      };
-      ws.addEventListener('message', handler);
-      ws.send(JSON.stringify({ type: 'sync-ping', clientSendTime: clientSend }));
-    }
-
-    function smoothDriftSync() {
-      if (!isMasterPlaying || !video.duration) return;
-      const serverNow = Date.now() + serverClockOffset;
-      const elapsed = (serverNow - masterTimelineStartEpoch) / 1000;
-      if (elapsed < 0) return;
-
-      const expectedTime = elapsed % video.duration;
-      const diff = video.currentTime - expectedTime;
-      if (Math.abs(diff) > video.duration / 2) return;
-
-      if (Math.abs(diff) < 0.035) {
-        video.playbackRate = 1.0;
-      } else if (diff > 0.035 && diff < 0.3) {
-        video.playbackRate = 0.98;
-      } else if (diff < -0.035 && diff > -0.3) {
-        video.playbackRate = 1.02;
-      } else if (Math.abs(diff) >= 0.3) {
-        video.currentTime = expectedTime;
-        video.playbackRate = 1.0;
-      }
     }
   </script>
 </body>
