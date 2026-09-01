@@ -29,6 +29,8 @@
       background-repeat: no-repeat;
       opacity: 0;
       will-change: opacity, background-position, background-size;
+      image-rendering: -webkit-optimize-contrast;
+      image-rendering: high-quality;
       z-index: 2;
     }
 
@@ -37,6 +39,8 @@
       color: #00ff66; font-family: monospace; font-size: 14px;
       background: rgba(0,0,0,0.8); padding: 8px 14px;
       border-radius: 6px; z-index: 100;
+      transition: opacity 0.8s ease-out;
+      pointer-events: none;
     }
   </style>
 </head>
@@ -81,7 +85,12 @@
     options.skipPlayersLoad = true;
     context.start(options);
 
-    // DIRECT JAVASCRIPT BEZEL & LAYOUT GEOMETRY ENGINE
+    function hideStatusOverlay() {
+      statusEl.style.opacity = '0';
+      setTimeout(() => { statusEl.style.display = 'none'; }, 800);
+    }
+
+    // Direct JavaScript Bezel & Layout Engine
     function applyGeometry() {
       const isSpan = (currentLayout === 'span');
       const totalWidthVw = 300 + (2 * currentBezel);
@@ -117,12 +126,13 @@
         if (msg.type === 'bezel-config') {
           currentBezel = parseFloat(msg.bezel || 2.0);
           applyGeometry();
-          statusEl.textContent = `Screen ${screenIndex} (Bezel: ${currentBezel}%)`;
           return;
         }
 
-        // --- KILL CAST COMMAND ---
+        // --- KILL CAST ---
         if (msg.type === 'kill-cast') {
+          statusEl.style.display = 'block';
+          statusEl.style.opacity = '1';
           statusEl.textContent = "Closing Cast...";
           setTimeout(() => { context.stop(); }, 500);
           return;
@@ -135,6 +145,8 @@
 
         // --- SHOW IMAGE WITH PARALLEL CROSSFADE ---
         if (msg.type === 'show-slide') {
+          hideStatusOverlay(); // Hide green overlay as soon as image is shown
+          
           currentLayout = msg.layout || 'span';
           applyGeometry();
 
@@ -169,19 +181,16 @@
 
           video.style.opacity = '0';
           video.pause();
-
-          statusEl.textContent = `Slide: ${msg.title || ''} (${currentLayout.toUpperCase()})`;
         }
 
         // --- PLAY VIDEO WALL LOOP ---
         if (msg.type === 'play-video') {
+          hideStatusOverlay();
           layers[0].style.opacity = '0';
           layers[1].style.opacity = '0';
           video.style.opacity = '1';
           video.src = `http://${host}/screen${screenIndex}.mp4`;
-          video.play().then(() => {
-            statusEl.textContent = `Playing Video Wall`;
-          });
+          video.play();
         }
 
         // --- BLACKOUT ---
@@ -190,7 +199,6 @@
           layers[1].style.opacity = '0';
           video.style.opacity = '0';
           video.pause();
-          statusEl.textContent = `Blackout`;
         }
       };
     }
