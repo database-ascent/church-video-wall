@@ -18,36 +18,36 @@
       width: 100vw; height: 100vh;
       object-fit: cover;
       opacity: 0;
-      transition: opacity 0.3s ease-in-out;
+      transition: opacity 0.5s ease-in-out;
       z-index: 1;
     }
 
-    #slide-layer {
+    /* Dual Crossfade Layers (A/B Double Buffering) */
+    .slide-layer {
       position: absolute; top: 0; left: 0;
       width: 100vw; height: 100vh;
       background-repeat: no-repeat;
       opacity: 0;
-      transition: opacity 0.3s ease-in-out;
       will-change: opacity, background-image;
       z-index: 2;
     }
 
     /* TILE MODE: Show full image centered on each TV */
-    body.mode-tile #slide-layer {
+    body.mode-tile .slide-layer {
       background-size: contain;
       background-position: center center;
     }
 
     /* SPAN MODE: Slice image across all 3 TVs */
-    body.mode-span[data-screen="1"] #slide-layer {
+    body.mode-span[data-screen="1"] .slide-layer {
       background-size: 300vw 100vh;
       background-position: 0vw 0;
     }
-    body.mode-span[data-screen="2"] #slide-layer {
+    body.mode-span[data-screen="2"] .slide-layer {
       background-size: 300vw 100vh;
       background-position: -100vw 0;
     }
-    body.mode-span[data-screen="3"] #slide-layer {
+    body.mode-span[data-screen="3"] .slide-layer {
       background-size: 300vw 100vh;
       background-position: -200vw 0;
     }
@@ -64,18 +64,22 @@
 </head>
 <body class="mode-span" data-screen="1">
   <div id="status-overlay">Waiting for Controller...</div>
-  <div id="slide-layer"></div>
+  <!-- Layer A and Layer B for seamless crossfading -->
+  <div id="slide-a" class="slide-layer"></div>
+  <div id="slide-b" class="slide-layer"></div>
   <video id="player" preload="auto" muted playsinline></video>
 
   <script>
     const statusEl = document.getElementById('status-overlay');
     const video = document.getElementById('player');
-    const slideLayer = document.getElementById('slide-layer');
+    const layerA = document.getElementById('slide-a');
+    const layerB = document.getElementById('slide-b');
     
     let screenIndex = 1;
     let ws = null;
     let serverHost = "";
-    const imageCache = new Map(); // In-memory image cache
+    let activeLayer = 'a'; // Alternates between 'a' and 'b'
+    const imageCache = new Map();
 
     const context = cast.framework.CastReceiverContext.getInstance();
     const CUSTOM_CHANNEL = 'urn:x-cast:com.church.videowall';
@@ -91,14 +95,11 @@
 
     context.start();
 
-    // Preload an image into memory and GPU buffer
     function preloadImage(url) {
       if (imageCache.has(url)) return imageCache.get(url);
       const img = new Image();
       img.src = url;
-      if (img.decode) {
-        img.decode().catch(() => {}); // Decode offscreen in background thread
-      }
+      if (img.decode) img.decode().catch(() => {});
       imageCache.set(url, img);
       return img;
     }
@@ -109,27 +110,45 @@
       ws.onmessage = async (event) => {
         const msg = JSON.parse(event.data);
 
-        // --- PRELOAD ENTIRE SLIDE DECK IN ADVANCE ---
+        // Pre-cache all slide images in memory
         if (msg.type === 'preload-slides' && Array.isArray(msg.slideUrls)) {
           msg.slideUrls.forEach(url => preloadImage(`http://${host}${url}`));
           return;
         }
 
-        // --- SHOW IMAGE / SLIDE (INSTANT SWAP) ---
+        // --- SHOW IMAGE WITH DUAL-LAYER CROSSFADE ---
         if (msg.type === 'show-slide') {
           document.body.className = msg.layout === 'tile' ? 'mode-tile' : 'mode-span';
           const fullImgUrl = `http://${host}${msg.slideUrl}`;
+          const fadeDuration = msg.fadeDuration !== undefined ? msg.fadeDuration : 1.0;
 
-          // Preload & Decode before displaying to guarantee 0ms jank
+          // Decode image before transition
           const imgObj = preloadImage(fullImgUrl);
-          
           if (imgObj.decode) {
             try { await imgObj.decode(); } catch(e) {}
           }
 
-          slideLayer.style.backgroundImage = `url('${fullImgUrl}')`;
-          slideLayer.classList.add('visible');
-          
+          // A/B Layer Dissolve Logic
+          const currentVisible = activeLayer === 'a' ? layerA : layerB;
+          const nextVisible = activeLayer === 'a' ? layerB : layerA;
+
+          // Set fade duration dynamically
+          nextVisible.style.transition = `opacity ${fadeDuration}s ease-in-out`;
+          currentVisible.style.transition = `opacity ${fadeDuration}s ease-in-out`;
+
+          // Put next image on the incoming layer and bring it on top
+          nextVisible.style.backgroundImage = `url('${fullImgUrl}')`;
+          nextVisible.style.zIndex = 3;
+          currentVisible.style.zIndex = 2;
+
+          // Crossfade
+          nextVisible.classList.add('visible');
+
+          setTimeout(() => {
+            currentVisible.classList.remove('visible');
+            activeLayer = activeLayer === 'a' ? 'b' : 'a';
+          }, (fadeDuration * 1000) + 50);
+
           video.classList.remove('visible');
           video.pause();
 
@@ -138,7 +157,8 @@
 
         // --- PLAY VIDEO WALL LOOP ---
         if (msg.type === 'play-video') {
-          slideLayer.classList.remove('visible');
+          layerA.classList.remove('visible');
+          layerB.classList.remove('visible');
           video.classList.add('visible');
           video.src = `http://${host}/screen${screenIndex}.mp4`;
           video.play().then(() => {
@@ -148,7 +168,8 @@
 
         // --- BLACKOUT ---
         if (msg.type === 'blackout') {
-          slideLayer.classList.remove('visible');
+          layerA.classList.remove('visible');
+          layerB.classList.remove('visible');
           video.classList.remove('visible');
           video.pause();
           statusEl.textContent = `Blackout`;
