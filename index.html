@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Vizio Wall Cast Receiver</title>
+  <!-- Google Cast Application Framework (CAF) SDK -->
+  <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      width: 100vw; height: 100vh;
+      background: #000;
+      overflow: hidden;
+    }
+    .screen-wrapper {
+      position: relative;
+      width: 100vw; height: 100vh;
+      overflow: hidden;
+    }
+    video {
+      position: absolute;
+      top: 0;
+      height: 100vh;
+      object-fit: fill;
+    }
+    #status-overlay {
+      position: fixed;
+      top: 15px; left: 15px;
+      color: #00ff66;
+      font-family: monospace;
+      font-size: 16px;
+      background: rgba(0,0,0,0.7);
+      padding: 8px 14px;
+      border-radius: 6px;
+      z-index: 100;
+    }
+  </style>
+</head>
+<body>
+  <div id="status-overlay">Waiting for Mac Controller...</div>
+  <div class="screen-wrapper">
+    <video id="player" preload="auto" muted playsinline></video>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status-overlay');
+    const video = document.getElementById('player');
+    
+    let screenIndex = 1; // 1 = Left, 2 = Center, 3 = Right
+    let bezelPercent = 2.0;
+    let ws = null;
+    let serverClockOffset = 0;
+    let isMasterPlaying = false;
+    let masterTimelineStartEpoch = 0;
+    let launchTimer = null;
+
+    // 1. Initialize Google Cast Receiver Context
+    const context = cast.framework.CastReceiverContext.getInstance();
+    const CUSTOM_CHANNEL = 'urn:x-cast:com.church.videowall';
+
+    // Listen for custom launch configuration from the Mac
+    context.addCustomMessageListener(CUSTOM_CHANNEL, (event) => {
+      const config = event.data; // e.g. { screen: 1, serverIp: "192.168.1.50:3000", bezel: 2.0 }
+      
+      screenIndex = config.screen;
+      bezelPercent = config.bezel || 2.0;
+      applyBezelGeometry(bezelPercent);
+      
+      statusEl.textContent = `Screen ${screenIndex} Initialized`;
+      connectToLocalMac(config.serverIp);
+    });
+
+    context.start();
+
+    // 2. Bezel Slicing Geometry
+    function applyBezelGeometry(bezel) {
+      const totalWidthVw = 300 + (2 * bezel);
+      video.style.width = `${totalWidthVw}vw`;
+      const leftOffsetVw = -((screenIndex - 1) * (100 + bezel));
+      video.style.left = `${leftOffsetVw}vw`;
+    }
+
+    // 3. Connect to Mac mini Local WebSocket & HTTP Server
+    function connectToLocalMac(serverHost) {
+      video.src = `http://${serverHost}/sample.mp4`;
+      ws = new WebSocket(`ws://${serverHost}`);
+
+      ws.onopen = () => {
+        statusEl.textContent = `Screen ${screenIndex} (Calibrating Clock...)`;
+        runClockCalibration(8);
+      };
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+
+        if (msg.type === 'bezel-config') {
+          bezelPercent = msg.bezel;
+          applyBezelGeometry(bezelPercent);
+        }
+
+        // Two-Phase Play (Arm -> Seek -> Fire)
+        if (msg.type === 'arm') {
+          if (launchTimer) clearTimeout(launchTimer);
+          isMasterPlaying = false;
+          video.playbackRate = 1.0;
+          video.pause();
+
+          const onSeeked = () => {
+            video.removeEventListener('seeked', onSeeked);
+            statusEl.textContent = `Screen ${screenIndex} (Armed & Ready)`;
+          };
+          video.addEventListener('seeked', onSeeked);
+          video.currentTime = msg.targetTime || 0;
+        }
+
+        if (msg.type === 'fire') {
+          if (launchTimer) clearTimeout(launchTimer);
+          masterTimelineStartEpoch = msg.timelineStartEpoch;
+
+          const targetClientEpoch = msg.launchEpoch - serverClockOffset;
+          const delay = Math.max(0, targetClientEpoch - Date.now());
+
+          launchTimer = setTimeout(() => {
+            isMasterPlaying = true;
+            video.playbackRate = 1.0;
+            video.play().then(() => {
+              statusEl.textContent = `Screen ${screenIndex} (Playing ▶)`;
+            });
+          }, delay);
+        }
+
+        if (msg.type === 'pause') {
+          isMasterPlaying = false;
+          video.pause();
+          statusEl.textContent = `Screen ${screenIndex} (Paused ⏸)`;
+        }
+
+        if (msg.type === 'heartbeat' && isMasterPlaying) {
+          masterTimelineStartEpoch = msg.timelineStartEpoch;
+          smoothDriftSync();
+        }
+      };
+    }
+
+    // 4. NTP Clock Calibration
+    function runClockCalibration(roundsLeft) {
+      if (roundsLeft <= 0) {
+        statusEl.textContent = `Screen ${screenIndex} (Ready)`;
+        return;
+      }
+      const clientSend = Date.now();
+      const handler = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'sync-pong') {
+          const now = Date.now();
+          const rtt = now - clientSend;
+          serverClockOffset = (msg.serverTime + (rtt / 2)) - now;
+          ws.removeEventListener('message', handler);
+          setTimeout(() => runClockCalibration(roundsLeft - 1), 30);
+        }
+      };
+      ws.addEventListener('message', handler);
+      ws.send(JSON.stringify({ type: 'sync-ping', clientSendTime: clientSend }));
+    }
+
+    // 5. Drift Correction (Stutter-Free Speed Tweaks)
+    function smoothDriftSync() {
+      if (!isMasterPlaying || !video.duration) return;
+      const serverNow = Date.now() + serverClockOffset;
+      const elapsed = (serverNow - masterTimelineStartEpoch) / 1000;
+      if (elapsed < 0) return;
+
+      const expectedTime = elapsed % video.duration;
+      const diff = video.currentTime - expectedTime;
+      if (Math.abs(diff) > video.duration / 2) return;
+
+      if (Math.abs(diff) < 0.035) {
+        video.playbackRate = 1.0;
+      } else if (diff > 0.035 && diff < 0.3) {
+        video.playbackRate = 0.98; // 2% slower
+      } else if (diff < -0.035 && diff > -0.3) {
+        video.playbackRate = 1.02; // 2% faster
+      } else if (Math.abs(diff) >= 0.3) {
+        video.currentTime = expectedTime;
+        video.playbackRate = 1.0;
+      }
+    }
+  </script>
+</body>
+</html>
