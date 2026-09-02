@@ -27,11 +27,24 @@
       position: absolute; top: 0; left: 0;
       width: 100vw; height: 100vh;
       background-repeat: no-repeat;
+      background-size: cover;
+      background-position: center center;
       opacity: 0;
-      will-change: opacity, background-position, background-size;
-      image-rendering: -webkit-optimize-contrast;
+      will-change: opacity, background-image;
       image-rendering: high-quality;
       z-index: 2;
+    }
+
+    /* TILE MODE: Show full image centered */
+    body.mode-tile .slide-layer {
+      background-size: contain;
+      background-position: center center;
+    }
+
+    /* SPAN MODE: Native 4K slice fills 100% of the screen */
+    body.mode-span .slide-layer {
+      background-size: cover;
+      background-position: center center;
     }
 
     #status-overlay {
@@ -44,7 +57,7 @@
     }
   </style>
 </head>
-<body>
+<body class="mode-span" data-screen="1">
   <div id="status-overlay">Waiting for Controller...</div>
   <div id="slide-a" class="slide-layer"></div>
   <div id="slide-b" class="slide-layer"></div>
@@ -61,7 +74,6 @@
     let screenIndex = 1;
     let ws = null;
     let serverHost = "";
-    let currentBezel = 2.0;
     let currentLayout = 'span';
     let currentLayerIndex = 0;
     const imageCache = new Map();
@@ -71,11 +83,10 @@
 
     context.addCustomMessageListener(CUSTOM_CHANNEL, (event) => {
       screenIndex = event.data.screen;
+      document.body.setAttribute('data-screen', screenIndex);
       serverHost = event.data.serverIp;
-      currentBezel = parseFloat(event.data.bezel || 2.0);
       
-      applyGeometry();
-      statusEl.textContent = `Screen ${screenIndex} Ready`;
+      statusEl.textContent = `Screen ${screenIndex} Ready (4K Native)`;
       connectToLocalMac(serverHost);
     });
 
@@ -88,23 +99,6 @@
     function hideStatusOverlay() {
       statusEl.style.opacity = '0';
       setTimeout(() => { statusEl.style.display = 'none'; }, 800);
-    }
-
-    // Direct JavaScript Bezel & Layout Engine
-    function applyGeometry() {
-      const isSpan = (currentLayout === 'span');
-      const totalWidthVw = 300 + (2 * currentBezel);
-      const leftOffsetVw = -((screenIndex - 1) * (100 + currentBezel));
-
-      layers.forEach(layer => {
-        if (isSpan) {
-          layer.style.backgroundSize = `${totalWidthVw}vw 100vh`;
-          layer.style.backgroundPosition = `${leftOffsetVw}vw 0px`;
-        } else {
-          layer.style.backgroundSize = 'contain';
-          layer.style.backgroundPosition = 'center center';
-        }
-      });
     }
 
     function preloadImage(url) {
@@ -122,38 +116,36 @@
       ws.onmessage = async (event) => {
         const msg = JSON.parse(event.data);
 
-        // --- REAL-TIME BEZEL ADJUSTMENT ---
-        if (msg.type === 'bezel-config') {
-          currentBezel = parseFloat(msg.bezel || 2.0);
-          applyGeometry();
-          return;
-        }
-
-        // --- KILL CAST ---
-        if (msg.type === 'kill-cast') {
-          statusEl.style.display = 'block';
-          statusEl.style.opacity = '1';
-          statusEl.textContent = "Closing Cast...";
-          setTimeout(() => { context.stop(); }, 500);
-          return;
-        }
-
         if (msg.type === 'preload-slides' && Array.isArray(msg.slideUrls)) {
-          msg.slideUrls.forEach(url => preloadImage(`http://${host}${url}`));
+          msg.slideUrls.forEach(url => {
+            const ext = url.slice(url.lastIndexOf('.'));
+            const base = url.slice(0, url.lastIndexOf('.'));
+            // Preload this TV's native 4K slice
+            preloadImage(`http://${host}${base}_screen${screenIndex}.jpg`);
+          });
           return;
         }
 
-        // --- SHOW IMAGE WITH PARALLEL CROSSFADE ---
+        // --- SHOW IMAGE WITH NATIVE 4K RESOLUTION ---
         if (msg.type === 'show-slide') {
-          hideStatusOverlay(); // Hide green overlay as soon as image is shown
-          
+          hideStatusOverlay();
           currentLayout = msg.layout || 'span';
-          applyGeometry();
+          document.body.className = (currentLayout === 'tile') ? 'mode-tile' : 'mode-span';
 
-          const fullImgUrl = `http://${host}${msg.slideUrl}`;
+          let targetUrl = "";
+          if (currentLayout === 'span') {
+            // Span Mode: Load this TV's dedicated 3840x2160 4K slice
+            const ext = msg.slideUrl.slice(msg.slideUrl.lastIndexOf('.'));
+            const base = msg.slideUrl.slice(0, msg.slideUrl.lastIndexOf('.'));
+            targetUrl = `http://${host}${base}_screen${screenIndex}.jpg`;
+          } else {
+            // Tile Mode: Load master image centered
+            targetUrl = `http://${host}${msg.slideUrl}`;
+          }
+
           const fadeDuration = parseFloat(msg.fadeDuration !== undefined ? msg.fadeDuration : 1.0);
 
-          const imgObj = preloadImage(fullImgUrl);
+          const imgObj = preloadImage(targetUrl);
           if (imgObj.decode) {
             try { await imgObj.decode(); } catch(e) {}
           }
@@ -164,7 +156,7 @@
 
           incoming.style.transition = 'none';
           incoming.style.opacity = '0';
-          incoming.style.backgroundImage = `url('${fullImgUrl}')`;
+          incoming.style.backgroundImage = `url('${targetUrl}')`;
           incoming.style.zIndex = '3';
           outgoing.style.zIndex = '2';
 
