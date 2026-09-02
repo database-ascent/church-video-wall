@@ -13,14 +13,38 @@
       overflow: hidden;
     }
     
-    /* Dual 4K Hardware Video Planes */
-    .video-layer {
+    video {
       position: absolute; top: 0; left: 0;
       width: 100vw; height: 100vh;
       object-fit: cover;
       opacity: 0;
-      will-change: opacity;
+      transition: opacity 0.5s ease-in-out;
+      z-index: 1;
+    }
+
+    /* Dual Crossfade Layers */
+    .slide-layer {
+      position: absolute; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background-repeat: no-repeat;
+      background-size: cover;
+      background-position: center center;
+      opacity: 0;
+      will-change: opacity, background-image;
+      image-rendering: high-quality;
       z-index: 2;
+    }
+
+    /* TILE MODE: Show full image centered */
+    body.mode-tile .slide-layer {
+      background-size: contain;
+      background-position: center center;
+    }
+
+    /* SPAN MODE: Native 4K slice fills 100% of the screen */
+    body.mode-span .slide-layer {
+      background-size: cover;
+      background-position: center center;
     }
 
     #status-overlay {
@@ -33,32 +57,36 @@
     }
   </style>
 </head>
-<body>
+<body class="mode-span" data-screen="1">
   <div id="status-overlay">Waiting for Controller...</div>
-  <!-- Dual 4K Hardware Video Decoders for Seamless Crossfade -->
-  <video id="video-a" class="video-layer" preload="auto" muted playsinline loop></video>
-  <video id="video-b" class="video-layer" preload="auto" muted playsinline loop></video>
+  <div id="slide-a" class="slide-layer"></div>
+  <div id="slide-b" class="slide-layer"></div>
+  <video id="player" preload="auto" muted playsinline></video>
 
   <script>
     const statusEl = document.getElementById('status-overlay');
-    const videoLayers = [
-      document.getElementById('video-a'),
-      document.getElementById('video-b')
+    const video = document.getElementById('player');
+    const layers = [
+      document.getElementById('slide-a'),
+      document.getElementById('slide-b')
     ];
     
     let screenIndex = 1;
     let ws = null;
     let serverHost = "";
-    let currentLayerIndex = 0; // Alternates between video-a (0) and video-b (1)
+    let currentLayout = 'span';
+    let currentLayerIndex = 0;
+    const imageCache = new Map();
 
     const context = cast.framework.CastReceiverContext.getInstance();
     const CUSTOM_CHANNEL = 'urn:x-cast:com.church.videowall';
 
     context.addCustomMessageListener(CUSTOM_CHANNEL, (event) => {
       screenIndex = event.data.screen;
+      document.body.setAttribute('data-screen', screenIndex);
       serverHost = event.data.serverIp;
       
-      statusEl.textContent = `Screen ${screenIndex} Ready (4K Hardware Direct)`;
+      statusEl.textContent = `Screen ${screenIndex} Ready`;
       connectToLocalMac(serverHost);
     });
 
@@ -73,81 +101,96 @@
       setTimeout(() => { statusEl.style.display = 'none'; }, 800);
     }
 
+    function preloadImage(url) {
+      if (imageCache.has(url)) return imageCache.get(url);
+      const img = new Image();
+      img.src = url;
+      if (img.decode) img.decode().catch(() => {});
+      imageCache.set(url, img);
+      return img;
+    }
+
     function connectToLocalMac(host) {
       ws = new WebSocket(`ws://${host}`);
 
       ws.onmessage = async (event) => {
         const msg = JSON.parse(event.data);
 
-        // --- KILL CAST ---
-        if (msg.type === 'kill-cast') {
-          statusEl.style.display = 'block';
-          statusEl.style.opacity = '1';
-          statusEl.textContent = "Closing Cast...";
-          setTimeout(() => { context.stop(); }, 500);
+        // Preload this TV's native 4K slice
+        if (msg.type === 'preload-slides' && Array.isArray(msg.slideUrls)) {
+          msg.slideUrls.forEach(url => {
+            const ext = url.slice(url.lastIndexOf('.'));
+            const base = url.slice(0, url.lastIndexOf('.'));
+            preloadImage(`http://${host}${base}_screen${screenIndex}.jpg`);
+          });
           return;
         }
 
-        // --- SHOW 4K HARDWARE VIDEO SLIDE ---
+        // --- SHOW NATIVE 4K IMAGE SLICE WITH CROSSFADE ---
         if (msg.type === 'show-slide') {
           hideStatusOverlay();
+          currentLayout = msg.layout || 'span';
+          document.body.className = (currentLayout === 'tile') ? 'mode-tile' : 'mode-span';
 
-          // Construct native 4K MP4 stream URL for this TV
-          const base = msg.slideUrl.slice(0, msg.slideUrl.lastIndexOf('.'));
-          const target4KVideoUrl = `http://${host}${base}_screen${screenIndex}.mp4`;
+          let targetUrl = "";
+          if (currentLayout === 'span') {
+            // Span Mode: Load this TV's dedicated 3840x2160 4K slice
+            const ext = msg.slideUrl.slice(msg.slideUrl.lastIndexOf('.'));
+            const base = msg.slideUrl.slice(0, msg.slideUrl.lastIndexOf('.'));
+            targetUrl = `http://${host}${base}_screen${screenIndex}.jpg`;
+          } else {
+            // Tile Mode: Load master image centered
+            targetUrl = `http://${host}${msg.slideUrl}`;
+          }
+
           const fadeDuration = parseFloat(msg.fadeDuration !== undefined ? msg.fadeDuration : 1.0);
 
+          const imgObj = preloadImage(targetUrl);
+          if (imgObj.decode) {
+            try { await imgObj.decode(); } catch(e) {}
+          }
+
           const incomingIndex = 1 - currentLayerIndex;
-          const incomingVideo = videoLayers[incomingIndex];
-          const outgoingVideo = videoLayers[currentLayerIndex];
+          const incoming = layers[incomingIndex];
+          const outgoing = layers[currentLayerIndex];
 
-          // 1. Prepare incoming 4K video player
-          incomingVideo.style.transition = 'none';
-          incomingVideo.style.opacity = '0';
-          incomingVideo.src = target4KVideoUrl;
-          incomingVideo.style.zIndex = '3';
-          outgoingVideo.style.zIndex = '2';
+          incoming.style.transition = 'none';
+          incoming.style.opacity = '0';
+          incoming.style.backgroundImage = `url('${targetUrl}')`;
+          incoming.style.zIndex = '3';
+          outgoing.style.zIndex = '2';
 
-          incomingVideo.load();
-          incomingVideo.play().then(() => {
-            void incomingVideo.offsetWidth; // Force layout flush
+          void incoming.offsetWidth; // Layout flush
 
-            // 2. Crossfade between hardware 4K video decoders
-            const transitionCss = `opacity ${fadeDuration}s cubic-bezier(0.4, 0.0, 0.2, 1)`;
-            incomingVideo.style.transition = transitionCss;
-            outgoingVideo.style.transition = transitionCss;
+          const transitionCss = `opacity ${fadeDuration}s cubic-bezier(0.4, 0.0, 0.2, 1)`;
+          incoming.style.transition = transitionCss;
+          outgoing.style.transition = transitionCss;
 
-            incomingVideo.style.opacity = '1';
-            outgoingVideo.style.opacity = '0';
+          incoming.style.opacity = '1';
+          outgoing.style.opacity = '0';
 
-            currentLayerIndex = incomingIndex;
+          currentLayerIndex = incomingIndex;
 
-            // Pause outgoing video once fade completes
-            setTimeout(() => {
-              outgoingVideo.pause();
-            }, (fadeDuration * 1000) + 100);
-          }).catch(e => {
-            console.error("4K Video play error", e);
-          });
+          video.style.opacity = '0';
+          video.pause();
         }
 
         // --- PLAY VIDEO WALL LOOP ---
         if (msg.type === 'play-video') {
           hideStatusOverlay();
-          const targetUrl = `http://${host}/screen${screenIndex}.mp4`;
-          const activeVideo = videoLayers[currentLayerIndex];
-          
-          activeVideo.src = targetUrl;
-          activeVideo.style.opacity = '1';
-          activeVideo.play();
+          layers[0].style.opacity = '0';
+          layers[1].style.opacity = '0';
+          video.style.opacity = '1';
+          video.src = `http://${host}/screen${screenIndex}.mp4`;
+          video.play();
         }
 
         // --- BLACKOUT ---
         if (msg.type === 'blackout') {
-          videoLayers[0].style.opacity = '0';
-          videoLayers[1].style.opacity = '0';
-          videoLayers[0].pause();
-          videoLayers[1].pause();
+          layers[0].style.opacity = '0';
+          layers[1].style.opacity = '0';
+          video.style.opacity = '0';
+          video.pause();
         }
       };
     }
