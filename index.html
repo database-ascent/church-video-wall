@@ -31,7 +31,7 @@
     #status-overlay {
       position: fixed; top: 15px; left: 15px;
       color: #00ff66; font-family: monospace; font-size: 14px;
-      background: rgba(0,0,0,0.85); padding: 8px 14px;
+      background: rgba(0,0,0,0.8); padding: 8px 14px;
       border-radius: 6px; z-index: 100;
       transition: opacity 0.8s ease-out;
       pointer-events: none;
@@ -53,7 +53,7 @@
     let screenIndex = 1;
     let ws = null;
     let serverHost = "";
-    let currentBezel = 1.0;
+    let currentBezel = 1.0; // DEFAULT 1.0%
     let currentLayout = 'span';
     let currentLayerIndex = 0;
     const imageCache = new Map();
@@ -61,26 +61,15 @@
     const context = cast.framework.CastReceiverContext.getInstance();
     const CUSTOM_CHANNEL = 'urn:x-cast:com.church.videowall';
 
-    // --- RECEIVE CONFIG FROM MAC WITH DEFENSIVE PARSING ---
     context.addCustomMessageListener(CUSTOM_CHANNEL, (event) => {
-      let data = event.data;
-      if (typeof data === 'string') {
-        try { data = JSON.parse(data); } catch(e) {}
-      }
-      if (!data) return;
-
-      screenIndex = parseInt(data.screen || 1, 10);
-      serverHost = data.serverIp || "";
-      currentBezel = parseFloat(data.bezel !== undefined ? data.bezel : 1.0);
-      
+      screenIndex = event.data.screen;
       document.body.setAttribute('data-screen', screenIndex);
-      statusEl.textContent = `Screen ${screenIndex} Connected (Loading...)`;
+      serverHost = event.data.serverIp;
+      currentBezel = parseFloat(event.data.bezel !== undefined ? event.data.bezel : 1.0);
       
       applyBezelGeometry(currentBezel);
-
-      if (serverHost) {
-        connectToLocalMac(serverHost);
-      }
+      statusEl.textContent = `Screen ${screenIndex} Ready`;
+      connectToLocalMac(serverHost);
     });
 
     const options = new cast.framework.CastReceiverOptions();
@@ -121,16 +110,14 @@
 
     function preloadImage(url) {
       if (imageCache.has(url)) return imageCache.get(url);
-      if (imageCache.size >= 8) {
-        const oldestKey = imageCache.keys().next().value;
-        imageCache.delete(oldestKey);
-      }
       const img = new Image();
       img.src = url;
+      if (img.decode) img.decode().catch(() => {});
       imageCache.set(url, img);
       return img;
     }
 
+    // AUTO-RECONNECTING WEBSOCKET ENGINE
     function connectToLocalMac(host) {
       if (!host) return;
       serverHost = host;
@@ -144,6 +131,16 @@
       ws.onopen = () => {
         statusEl.textContent = `Screen ${screenIndex} Ready`;
         setTimeout(hideStatusOverlay, 2000);
+      };
+
+      // If Wi-Fi blips, reconnect automatically every 2 seconds
+      ws.onclose = () => {
+        console.log("WebSocket connection dropped. Reconnecting...");
+        setTimeout(() => connectToLocalMac(serverHost), 2000);
+      };
+
+      ws.onerror = () => {
+        try { ws.close(); } catch(e) {}
       };
 
       ws.onmessage = async (event) => {
@@ -170,7 +167,6 @@
           return;
         }
 
-        // --- SMOOTH A/B CROSSFADE ---
         if (msg.type === 'show-slide') {
           hideStatusOverlay();
           currentLayout = msg.layout || 'span';
@@ -186,7 +182,11 @@
           }
 
           const fadeDuration = parseFloat(msg.fadeDuration !== undefined ? msg.fadeDuration : 1.0);
-          preloadImage(targetUrl);
+
+          const imgObj = preloadImage(targetUrl);
+          if (imgObj.decode) {
+            try { await imgObj.decode(); } catch(e) {}
+          }
 
           const incomingIndex = 1 - currentLayerIndex;
           const incoming = layers[incomingIndex];
@@ -198,7 +198,7 @@
           incoming.style.zIndex = '3';
           outgoing.style.zIndex = '2';
 
-          void incoming.offsetWidth; // Force layout flush
+          void incoming.offsetWidth;
 
           const transitionCss = `opacity ${fadeDuration}s cubic-bezier(0.4, 0.0, 0.2, 1)`;
           incoming.style.transition = transitionCss;
