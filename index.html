@@ -13,6 +13,7 @@
       overflow: hidden;
     }
     
+    /* Dual Hardware Accelerated Crossfade Layers */
     .slide-layer {
       position: absolute; top: 0; left: 0;
       width: 100vw; height: 100vh;
@@ -55,15 +56,8 @@
     let serverHost = "";
     let currentBezel = 1.0;
     let currentLayout = 'span';
-    let currentLayerIndex = 0;
-    let serverClockOffset = 0;
-    const imageCache = new Map();
-
-    // MASTER-CLOCK FRAME-LOCK ANIMATION STATE
-    let isTransitioning = false;
-    let transitionStartEpoch = 0;
-    let transitionDurationMs = 1000;
-    let incomingLayerIndex = 1;
+    let activeLayerIndex = 0; // The currently visible layer (0 = Layer A, 1 = Layer B)
+    let armedLayerIndex = 1;  // The background layer waiting with the next image
 
     const context = cast.framework.CastReceiverContext.getInstance();
     const CUSTOM_CHANNEL = 'urn:x-cast:com.church.videowall';
@@ -80,7 +74,7 @@
       currentBezel = parseFloat(data.bezel !== undefined ? data.bezel : 1.0);
       
       document.body.setAttribute('data-screen', screenIndex);
-      statusEl.textContent = `Screen ${screenIndex} Initialized`;
+      statusEl.textContent = `Screen ${screenIndex} Ready`;
       
       applyBezelGeometry(currentBezel);
       if (serverHost) {
@@ -124,77 +118,6 @@
       });
     }
 
-    function preloadImage(url) {
-      if (imageCache.has(url)) return imageCache.get(url);
-      if (imageCache.size >= 8) {
-        const oldestKey = imageCache.keys().next().value;
-        imageCache.delete(oldestKey);
-      }
-      const img = new Image();
-      img.src = url;
-      if (img.decode) img.decode().catch(() => {});
-      imageCache.set(url, img);
-      return img;
-    }
-
-    // --- HIGH-PRECISION NTP CLOCK CALIBRATION ---
-    function calibrateClock(roundsLeft, samples = []) {
-      if (roundsLeft <= 0) {
-        samples.sort((a, b) => a.rtt - b.rtt);
-        serverClockOffset = samples[0].offset;
-        statusEl.textContent = `Screen ${screenIndex} Ready (Locked: ±${Math.round(samples[0].rtt / 2)}ms)`;
-        setTimeout(hideStatusOverlay, 2000);
-        return;
-      }
-
-      const clientSend = Date.now();
-      const handler = (e) => {
-        const msg = JSON.parse(e.data);
-        if (msg.type === 'sync-pong') {
-          const now = Date.now();
-          const rtt = now - clientSend;
-          const offset = (msg.serverTime + (rtt / 2)) - now;
-          samples.push({ rtt, offset });
-          ws.removeEventListener('message', handler);
-          setTimeout(() => calibrateClock(roundsLeft - 1, samples), 35);
-        }
-      };
-      ws.addEventListener('message', handler);
-      ws.send(JSON.stringify({ type: 'sync-ping', clientSendTime: clientSend }));
-    }
-
-    // --- MASTER-CLOCK FRAME-LOCKED RENDER LOOP (requestAnimationFrame) ---
-    function masterRenderLoop() {
-      if (isTransitioning) {
-        const currentServerTime = Date.now() + serverClockOffset;
-        const elapsed = currentServerTime - transitionStartEpoch;
-
-        if (elapsed < 0) {
-          // Waiting for start timestamp
-          layers[incomingLayerIndex].style.opacity = '0';
-          layers[1 - incomingLayerIndex].style.opacity = '1';
-        } else if (elapsed >= transitionDurationMs) {
-          // Transition complete
-          layers[incomingLayerIndex].style.opacity = '1';
-          layers[1 - incomingLayerIndex].style.opacity = '0';
-          currentLayerIndex = incomingLayerIndex;
-          isTransitioning = false;
-        } else {
-          // In flight: Compute mathematical progress locked to physical clock
-          const linearProgress = elapsed / transitionDurationMs;
-          // Cubic Smoothstep Curve for cinematic ease-in-out: 3p^2 - 2p^3
-          const smoothProgress = (3 * Math.pow(linearProgress, 2)) - (2 * Math.pow(linearProgress, 3));
-
-          layers[incomingLayerIndex].style.opacity = smoothProgress;
-          layers[1 - incomingLayerIndex].style.opacity = (1 - smoothProgress);
-        }
-      }
-
-      requestAnimationFrame(masterRenderLoop);
-    }
-    // Start continuous 60fps frame loop
-    requestAnimationFrame(masterRenderLoop);
-
     function connectToLocalMac(host) {
       if (!host) return;
       serverHost = host;
@@ -206,7 +129,8 @@
       ws = new WebSocket(`ws://${host}`);
 
       ws.onopen = () => {
-        calibrateClock(6);
+        statusEl.textContent = `Screen ${screenIndex} Ready`;
+        setTimeout(hideStatusOverlay, 2000);
       };
 
       ws.onmessage = async (event) => {
@@ -225,18 +149,10 @@
           return;
         }
 
-        if (msg.type === 'preload-next' && msg.slideUrl) {
-          const base = msg.slideUrl.slice(0, msg.slideUrl.lastIndexOf('.'));
-          const nextUrl = currentLayout === 'span' 
-            ? `http://${host}${base}_screen${screenIndex}.jpg` 
-            : `http://${host}${msg.slideUrl}`;
-          preloadImage(nextUrl);
-          return;
-        }
-
-        // --- PREPARE SLIDE & ENGAGE MASTER TIME LOCK ---
-        if (msg.type === 'show-slide') {
-          hideStatusOverlay();
+        // ==========================================
+        // PHASE 1: ARM SLIDE (Load & Decode in Background)
+        // ==========================================
+        if (msg.type === 'arm-slide') {
           currentLayout = msg.layout || 'span';
           document.body.className = (currentLayout === 'tile') ? 'mode-tile' : 'mode-span';
           applyBezelGeometry(currentBezel);
@@ -249,34 +165,50 @@
             targetUrl = `http://${host}${msg.slideUrl}`;
           }
 
-          // Pre-decode into RAM immediately
-          const imgObj = preloadImage(targetUrl);
-          if (imgObj.decode) {
-            try { await imgObj.decode(); } catch(e) {}
+          // Preload & decode image immediately into GPU memory
+          const img = new Image();
+          img.src = targetUrl;
+          if (img.decode) {
+            try { await img.decode(); } catch(e) {}
           }
 
-          incomingLayerIndex = 1 - currentLayerIndex;
-          const incoming = layers[incomingLayerIndex];
-          const outgoing = layers[currentLayerIndex];
+          // Set the image on the background layer at Opacity: 0
+          armedLayerIndex = 1 - activeLayerIndex;
+          const armedLayer = layers[armedLayerIndex];
 
-          // 1. Prepare GPU layers
-          incoming.style.transition = 'none'; // No CSS transitions (controlled by Master Clock)
-          outgoing.style.transition = 'none';
-          incoming.style.opacity = '0';
-          incoming.style.backgroundImage = `url('${targetUrl}')`;
-          incoming.style.zIndex = '3';
-          outgoing.style.zIndex = '2';
+          armedLayer.style.transition = 'none';
+          armedLayer.style.opacity = '0';
+          armedLayer.style.backgroundImage = `url('${targetUrl}')`;
+          armedLayer.style.zIndex = '3';
+          layers[activeLayerIndex].style.zIndex = '2';
 
-          void incoming.offsetWidth; // Force layout flush
+          void armedLayer.offsetWidth; // Force GPU layout commit
+        }
 
-          // 2. Lock onto master physical timestamp
-          transitionStartEpoch = msg.targetTime || (Date.now() + serverClockOffset);
-          transitionDurationMs = Math.max(50, parseFloat(msg.fadeDuration !== undefined ? msg.fadeDuration : 1.0) * 1000);
-          isTransitioning = true;
+        // ==========================================
+        // PHASE 2: TRIGGER TRANSITION (Real-Time Cue)
+        // ==========================================
+        if (msg.type === 'trigger-transition') {
+          hideStatusOverlay();
+          const fadeDuration = parseFloat(msg.fadeDuration !== undefined ? msg.fadeDuration : 1.0);
+
+          const incoming = layers[armedLayerIndex];
+          const outgoing = layers[activeLayerIndex];
+
+          // Instant zero-delay CSS crossfade
+          const transitionCss = `opacity ${fadeDuration}s cubic-bezier(0.4, 0.0, 0.2, 1)`;
+          incoming.style.transition = transitionCss;
+          outgoing.style.transition = transitionCss;
+
+          incoming.style.opacity = '1';
+          outgoing.style.opacity = '0';
+
+          activeLayerIndex = armedLayerIndex;
         }
 
         if (msg.type === 'blackout') {
-          isTransitioning = false;
+          layers[0].style.transition = 'opacity 0.3s ease';
+          layers[1].style.transition = 'opacity 0.3s ease';
           layers[0].style.opacity = '0';
           layers[1].style.opacity = '0';
         }
