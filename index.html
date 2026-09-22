@@ -31,7 +31,7 @@
     #status-overlay {
       position: fixed; top: 15px; left: 15px;
       color: #00ff66; font-family: monospace; font-size: 14px;
-      background: rgba(0,0,0,0.8); padding: 8px 14px;
+      background: rgba(0,0,0,0.85); padding: 8px 14px;
       border-radius: 6px; z-index: 100;
       transition: opacity 0.8s ease-out;
       pointer-events: none;
@@ -61,15 +61,26 @@
     const context = cast.framework.CastReceiverContext.getInstance();
     const CUSTOM_CHANNEL = 'urn:x-cast:com.church.videowall';
 
+    // --- RECEIVE CONFIG FROM MAC WITH DEFENSIVE PARSING ---
     context.addCustomMessageListener(CUSTOM_CHANNEL, (event) => {
-      screenIndex = event.data.screen;
+      let data = event.data;
+      if (typeof data === 'string') {
+        try { data = JSON.parse(data); } catch(e) {}
+      }
+      if (!data) return;
+
+      screenIndex = parseInt(data.screen || 1, 10);
+      serverHost = data.serverIp || "";
+      currentBezel = parseFloat(data.bezel !== undefined ? data.bezel : 1.0);
+      
       document.body.setAttribute('data-screen', screenIndex);
-      serverHost = event.data.serverIp;
-      currentBezel = parseFloat(event.data.bezel !== undefined ? event.data.bezel : 1.0);
+      statusEl.textContent = `Screen ${screenIndex} Connected (Loading...)`;
       
       applyBezelGeometry(currentBezel);
-      statusEl.textContent = `Screen ${screenIndex} Ready`;
-      connectToLocalMac(serverHost);
+
+      if (serverHost) {
+        connectToLocalMac(serverHost);
+      }
     });
 
     const options = new cast.framework.CastReceiverOptions();
@@ -83,7 +94,6 @@
       setTimeout(() => { statusEl.style.display = 'none'; }, 800);
     }
 
-    // --- CLEAN BEZEL COMPENSATION FOR SLICES ---
     function applyBezelGeometry(bezel) {
       currentBezel = parseFloat(bezel !== undefined ? bezel : 1.0);
       if (currentLayout !== 'span') {
@@ -111,13 +121,10 @@
 
     function preloadImage(url) {
       if (imageCache.has(url)) return imageCache.get(url);
-      
-      // Clean memory cap: keep up to 8 images in RAM
       if (imageCache.size >= 8) {
         const oldestKey = imageCache.keys().next().value;
         imageCache.delete(oldestKey);
       }
-
       const img = new Image();
       img.src = url;
       imageCache.set(url, img);
@@ -142,13 +149,11 @@
       ws.onmessage = async (event) => {
         const msg = JSON.parse(event.data);
 
-        // --- REAL-TIME BEZEL ADJUSTMENT ---
         if (msg.type === 'bezel-config') {
           applyBezelGeometry(msg.bezel);
           return;
         }
 
-        // --- KILL CAST ---
         if (msg.type === 'kill-cast') {
           statusEl.style.display = 'block';
           statusEl.style.opacity = '1';
@@ -165,7 +170,7 @@
           return;
         }
 
-        // --- BUTTERY-SMOOTH A/B CROSSFADE ---
+        // --- SMOOTH A/B CROSSFADE ---
         if (msg.type === 'show-slide') {
           hideStatusOverlay();
           currentLayout = msg.layout || 'span';
@@ -187,16 +192,14 @@
           const incoming = layers[incomingIndex];
           const outgoing = layers[currentLayerIndex];
 
-          // 1. Prepare incoming layer behind or at 0 opacity
           incoming.style.transition = 'none';
           incoming.style.opacity = '0';
           incoming.style.backgroundImage = `url('${targetUrl}')`;
           incoming.style.zIndex = '3';
           outgoing.style.zIndex = '2';
 
-          void incoming.offsetWidth; // Force paint
+          void incoming.offsetWidth; // Force layout flush
 
-          // 2. Smooth Parallel Cross-Dissolve
           const transitionCss = `opacity ${fadeDuration}s cubic-bezier(0.4, 0.0, 0.2, 1)`;
           incoming.style.transition = transitionCss;
           outgoing.style.transition = transitionCss;
@@ -207,7 +210,6 @@
           currentLayerIndex = incomingIndex;
         }
 
-        // --- BLACKOUT ---
         if (msg.type === 'blackout') {
           layers[0].style.opacity = '0';
           layers[1].style.opacity = '0';
