@@ -56,10 +56,6 @@
     let currentBezel = 1.0;
     let currentLayout = 'span';
     let currentLayerIndex = 0;
-    let reconnectTimer = null;
-    
-    // Bounded in-memory cache to prevent smart TV RAM exhaustion
-    const MAX_CACHE_SIZE = 4;
     const imageCache = new Map();
 
     const context = cast.framework.CastReceiverContext.getInstance();
@@ -87,6 +83,7 @@
       setTimeout(() => { statusEl.style.display = 'none'; }, 800);
     }
 
+    // --- CLEAN BEZEL COMPENSATION FOR SLICES ---
     function applyBezelGeometry(bezel) {
       currentBezel = parseFloat(bezel !== undefined ? bezel : 1.0);
       if (currentLayout !== 'span') {
@@ -112,14 +109,13 @@
       });
     }
 
-    // Memory-Safe Image Preloader
     function preloadImage(url) {
       if (imageCache.has(url)) return imageCache.get(url);
       
-      // Keep only last 4 images in RAM to prevent crashes
-      if (imageCache.size >= MAX_CACHE_SIZE) {
-        const firstKey = imageCache.keys().next().value;
-        imageCache.delete(firstKey);
+      // Clean memory cap: keep up to 8 images in RAM
+      if (imageCache.size >= 8) {
+        const oldestKey = imageCache.keys().next().value;
+        imageCache.delete(oldestKey);
       }
 
       const img = new Image();
@@ -128,114 +124,95 @@
       return img;
     }
 
-    // AUTO-RECONNECTING WEBSOCKET CLIENT
     function connectToLocalMac(host) {
       if (!host) return;
       serverHost = host;
 
-      if (reconnectTimer) clearTimeout(reconnectTimer);
       if (ws) {
         try { ws.close(); } catch(e) {}
       }
 
-      try {
-        ws = new WebSocket(`ws://${host}`);
+      ws = new WebSocket(`ws://${host}`);
 
-        ws.onopen = () => {
-          statusEl.textContent = `Screen ${screenIndex} Ready`;
-          setTimeout(hideStatusOverlay, 2000);
-        };
+      ws.onopen = () => {
+        statusEl.textContent = `Screen ${screenIndex} Ready`;
+        setTimeout(hideStatusOverlay, 2000);
+      };
 
-        ws.onclose = () => {
-          console.log("WebSocket dropped, reconnecting in 2s...");
-          reconnectTimer = setTimeout(() => connectToLocalMac(serverHost), 2000);
-        };
+      ws.onmessage = async (event) => {
+        const msg = JSON.parse(event.data);
 
-        ws.onerror = () => {
-          try { ws.close(); } catch(e) {}
-        };
+        // --- REAL-TIME BEZEL ADJUSTMENT ---
+        if (msg.type === 'bezel-config') {
+          applyBezelGeometry(msg.bezel);
+          return;
+        }
 
-        ws.onmessage = async (event) => {
-          const msg = JSON.parse(event.data);
+        // --- KILL CAST ---
+        if (msg.type === 'kill-cast') {
+          statusEl.style.display = 'block';
+          statusEl.style.opacity = '1';
+          statusEl.textContent = "Closing Cast...";
+          setTimeout(() => { context.stop(); }, 500);
+          return;
+        }
 
-          if (msg.type === 'bezel-config') {
-            applyBezelGeometry(msg.bezel);
-            return;
+        if (msg.type === 'preload-slides' && Array.isArray(msg.slideUrls)) {
+          msg.slideUrls.forEach(url => {
+            const base = url.slice(0, url.lastIndexOf('.'));
+            preloadImage(`http://${host}${base}_screen${screenIndex}.jpg`);
+          });
+          return;
+        }
+
+        // --- BUTTERY-SMOOTH A/B CROSSFADE ---
+        if (msg.type === 'show-slide') {
+          hideStatusOverlay();
+          currentLayout = msg.layout || 'span';
+          document.body.className = (currentLayout === 'tile') ? 'mode-tile' : 'mode-span';
+          applyBezelGeometry(currentBezel);
+
+          let targetUrl = "";
+          if (currentLayout === 'span') {
+            const base = msg.slideUrl.slice(0, msg.slideUrl.lastIndexOf('.'));
+            targetUrl = `http://${host}${base}_screen${screenIndex}.jpg`;
+          } else {
+            targetUrl = `http://${host}${msg.slideUrl}`;
           }
 
-          if (msg.type === 'kill-cast') {
-            statusEl.style.display = 'block';
-            statusEl.style.opacity = '1';
-            statusEl.textContent = "Closing Cast...";
-            setTimeout(() => { context.stop(); }, 500);
-            return;
-          }
+          const fadeDuration = parseFloat(msg.fadeDuration !== undefined ? msg.fadeDuration : 1.0);
+          preloadImage(targetUrl);
 
-          if (msg.type === 'preload-slides' && Array.isArray(msg.slideUrls)) {
-            msg.slideUrls.slice(0, 3).forEach(url => {
-              const base = url.slice(0, url.lastIndexOf('.'));
-              preloadImage(`http://${host}${base}_screen${screenIndex}.jpg`);
-            });
-            return;
-          }
+          const incomingIndex = 1 - currentLayerIndex;
+          const incoming = layers[incomingIndex];
+          const outgoing = layers[currentLayerIndex];
 
-          if (msg.type === 'show-slide') {
-            hideStatusOverlay();
-            currentLayout = msg.layout || 'span';
-            document.body.className = (currentLayout === 'tile') ? 'mode-tile' : 'mode-span';
-            applyBezelGeometry(currentBezel);
+          // 1. Prepare incoming layer behind or at 0 opacity
+          incoming.style.transition = 'none';
+          incoming.style.opacity = '0';
+          incoming.style.backgroundImage = `url('${targetUrl}')`;
+          incoming.style.zIndex = '3';
+          outgoing.style.zIndex = '2';
 
-            let targetUrl = "";
-            if (currentLayout === 'span') {
-              const base = msg.slideUrl.slice(0, msg.slideUrl.lastIndexOf('.'));
-              targetUrl = `http://${host}${base}_screen${screenIndex}.jpg`;
-            } else {
-              targetUrl = `http://${host}${msg.slideUrl}`;
-            }
+          void incoming.offsetWidth; // Force paint
 
-            const fadeDuration = parseFloat(msg.fadeDuration !== undefined ? msg.fadeDuration : 1.0);
+          // 2. Smooth Parallel Cross-Dissolve
+          const transitionCss = `opacity ${fadeDuration}s cubic-bezier(0.4, 0.0, 0.2, 1)`;
+          incoming.style.transition = transitionCss;
+          outgoing.style.transition = transitionCss;
 
-            // Preload with 300ms timeout guard
-            const imgObj = preloadImage(targetUrl);
-            if (imgObj.decode) {
-              try {
-                await Promise.race([
-                  imgObj.decode(),
-                  new Promise(resolve => setTimeout(resolve, 300))
-                ]);
-              } catch(e) {}
-            }
+          incoming.style.opacity = '1';
+          outgoing.style.opacity = '0';
 
-            const incomingIndex = 1 - currentLayerIndex;
-            const incoming = layers[incomingIndex];
-            const outgoing = layers[currentLayerIndex];
+          currentLayerIndex = incomingIndex;
+        }
 
-            incoming.style.transition = 'none';
-            incoming.style.opacity = '0';
-            incoming.style.backgroundImage = `url('${targetUrl}')`;
-            incoming.style.zIndex = '3';
-            outgoing.style.zIndex = '2';
-
-            void incoming.offsetWidth; // Layout flush
-
-            const transitionCss = `opacity ${fadeDuration}s cubic-bezier(0.4, 0.0, 0.2, 1)`;
-            incoming.style.transition = transitionCss;
-            outgoing.style.transition = transitionCss;
-
-            incoming.style.opacity = '1';
-            outgoing.style.opacity = '0';
-
-            currentLayerIndex = incomingIndex;
-          }
-
-          if (msg.type === 'blackout') {
-            layers[0].style.opacity = '0';
-            layers[1].style.opacity = '0';
-          }
-        };
-      } catch (e) {
-        reconnectTimer = setTimeout(() => connectToLocalMac(serverHost), 2000);
-      }
+        // --- BLACKOUT ---
+        if (msg.type === 'blackout') {
+          layers[0].style.opacity = '0';
+          layers[1].style.opacity = '0';
+        }
+      };
     }
   </script>
 </body>
