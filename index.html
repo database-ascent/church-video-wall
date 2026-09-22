@@ -13,16 +13,6 @@
       overflow: hidden;
     }
     
-    video {
-      position: absolute; top: 0; left: 0;
-      width: 100vw; height: 100vh;
-      object-fit: cover;
-      opacity: 0;
-      transition: opacity 0.5s ease-in-out;
-      z-index: 1;
-    }
-
-    /* Dual Crossfade Layers */
     .slide-layer {
       position: absolute; top: 0; left: 0;
       width: 100vw; height: 100vh;
@@ -33,7 +23,6 @@
       z-index: 2;
     }
 
-    /* TILE MODE: Show full image centered */
     body.mode-tile .slide-layer {
       background-size: contain !important;
       background-position: center center !important;
@@ -53,11 +42,9 @@
   <div id="status-overlay">Waiting for Controller...</div>
   <div id="slide-a" class="slide-layer"></div>
   <div id="slide-b" class="slide-layer"></div>
-  <video id="player" preload="auto" muted playsinline></video>
 
   <script>
     const statusEl = document.getElementById('status-overlay');
-    const video = document.getElementById('player');
     const layers = [
       document.getElementById('slide-a'),
       document.getElementById('slide-b')
@@ -66,7 +53,7 @@
     let screenIndex = 1;
     let ws = null;
     let serverHost = "";
-    let currentBezel = 2.0;
+    let currentBezel = 1.0; // DEFAULT 1.0%
     let currentLayout = 'span';
     let currentLayerIndex = 0;
     const imageCache = new Map();
@@ -78,7 +65,7 @@
       screenIndex = event.data.screen;
       document.body.setAttribute('data-screen', screenIndex);
       serverHost = event.data.serverIp;
-      currentBezel = parseFloat(event.data.bezel || 2.0);
+      currentBezel = parseFloat(event.data.bezel !== undefined ? event.data.bezel : 1.0);
       
       applyBezelGeometry(currentBezel);
       statusEl.textContent = `Screen ${screenIndex} Ready`;
@@ -96,9 +83,8 @@
       setTimeout(() => { statusEl.style.display = 'none'; }, 800);
     }
 
-    // --- REAL-TIME BEZEL COMPENSATION ENGINE FOR SLICES ---
     function applyBezelGeometry(bezel) {
-      currentBezel = parseFloat(bezel !== undefined ? bezel : 2.0);
+      currentBezel = parseFloat(bezel !== undefined ? bezel : 1.0);
       if (currentLayout !== 'span') {
         layers.forEach(layer => {
           layer.style.backgroundSize = 'contain';
@@ -107,19 +93,15 @@
         return;
       }
 
-      // In Span Mode, shift the sliced images slightly behind the plastic frames
       const b = currentBezel;
       layers.forEach(layer => {
         if (screenIndex === 1) {
-          // Left TV: crop right edge under frame
           layer.style.backgroundSize = `calc(100% + ${b}vw) 100%`;
           layer.style.backgroundPosition = '0% center';
         } else if (screenIndex === 2) {
-          // Center TV: crop both left and right edges under frames
           layer.style.backgroundSize = `calc(100% + ${2 * b}vw) 100%`;
           layer.style.backgroundPosition = 'center center';
         } else if (screenIndex === 3) {
-          // Right TV: crop left edge under frame
           layer.style.backgroundSize = `calc(100% + ${b}vw) 100%`;
           layer.style.backgroundPosition = '100% center';
         }
@@ -135,19 +117,40 @@
       return img;
     }
 
+    // AUTO-RECONNECTING WEBSOCKET ENGINE
     function connectToLocalMac(host) {
+      if (!host) return;
+      serverHost = host;
+
+      if (ws) {
+        try { ws.close(); } catch(e) {}
+      }
+
       ws = new WebSocket(`ws://${host}`);
+
+      ws.onopen = () => {
+        statusEl.textContent = `Screen ${screenIndex} Ready`;
+        setTimeout(hideStatusOverlay, 2000);
+      };
+
+      // If Wi-Fi blips, reconnect automatically every 2 seconds
+      ws.onclose = () => {
+        console.log("WebSocket connection dropped. Reconnecting...");
+        setTimeout(() => connectToLocalMac(serverHost), 2000);
+      };
+
+      ws.onerror = () => {
+        try { ws.close(); } catch(e) {}
+      };
 
       ws.onmessage = async (event) => {
         const msg = JSON.parse(event.data);
 
-        // --- REAL-TIME BEZEL ADJUSTMENT ---
         if (msg.type === 'bezel-config') {
           applyBezelGeometry(msg.bezel);
           return;
         }
 
-        // --- KILL CAST ---
         if (msg.type === 'kill-cast') {
           statusEl.style.display = 'block';
           statusEl.style.opacity = '1';
@@ -164,7 +167,6 @@
           return;
         }
 
-        // --- SHOW IMAGE ---
         if (msg.type === 'show-slide') {
           hideStatusOverlay();
           currentLayout = msg.layout || 'span';
@@ -196,7 +198,7 @@
           incoming.style.zIndex = '3';
           outgoing.style.zIndex = '2';
 
-          void incoming.offsetWidth; // Flush DOM
+          void incoming.offsetWidth;
 
           const transitionCss = `opacity ${fadeDuration}s cubic-bezier(0.4, 0.0, 0.2, 1)`;
           incoming.style.transition = transitionCss;
@@ -206,27 +208,11 @@
           outgoing.style.opacity = '0';
 
           currentLayerIndex = incomingIndex;
-
-          video.style.opacity = '0';
-          video.pause();
         }
 
-        // --- PLAY VIDEO WALL LOOP ---
-        if (msg.type === 'play-video') {
-          hideStatusOverlay();
-          layers[0].style.opacity = '0';
-          layers[1].style.opacity = '0';
-          video.style.opacity = '1';
-          video.src = `http://${host}/screen${screenIndex}.mp4`;
-          video.play();
-        }
-
-        // --- BLACKOUT ---
         if (msg.type === 'blackout') {
           layers[0].style.opacity = '0';
           layers[1].style.opacity = '0';
-          video.style.opacity = '0';
-          video.pause();
         }
       };
     }
