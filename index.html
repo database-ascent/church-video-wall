@@ -13,7 +13,6 @@
       overflow: hidden;
     }
     
-    /* Dual Hardware Accelerated Crossfade Layers */
     .slide-layer {
       position: absolute; top: 0; left: 0;
       width: 100vw; height: 100vh;
@@ -56,8 +55,8 @@
     let serverHost = "";
     let currentBezel = 1.0;
     let currentLayout = 'span';
-    let activeLayerIndex = 0; // The currently visible layer (0 = Layer A, 1 = Layer B)
-    let armedLayerIndex = 1;  // The background layer waiting with the next image
+    let currentLayerIndex = 0; // Alternates between 0 (Layer A) and 1 (Layer B)
+    const imageCache = new Map();
 
     const context = cast.framework.CastReceiverContext.getInstance();
     const CUSTOM_CHANNEL = 'urn:x-cast:com.church.videowall';
@@ -118,6 +117,20 @@
       });
     }
 
+    // Silent background preloader (caches in RAM without touching screen layers)
+    function preloadImage(url) {
+      if (imageCache.has(url)) return imageCache.get(url);
+      if (imageCache.size >= 8) {
+        const oldestKey = imageCache.keys().next().value;
+        imageCache.delete(oldestKey);
+      }
+      const img = new Image();
+      img.src = url;
+      if (img.decode) img.decode().catch(() => {});
+      imageCache.set(url, img);
+      return img;
+    }
+
     function connectToLocalMac(host) {
       if (!host) return;
       serverHost = host;
@@ -149,10 +162,19 @@
           return;
         }
 
-        // ==========================================
-        // PHASE 1: ARM SLIDE (Load & Decode in Background)
-        // ==========================================
-        if (msg.type === 'arm-slide') {
+        // SILENT LOOKAHEAD: Downloads the next upcoming slide in RAM in advance
+        if (msg.type === 'preload-next' && msg.slideUrl) {
+          const base = msg.slideUrl.slice(0, msg.slideUrl.lastIndexOf('.'));
+          const nextUrl = currentLayout === 'span' 
+            ? `http://${host}${base}_screen${screenIndex}.jpg` 
+            : `http://${host}${msg.slideUrl}`;
+          preloadImage(nextUrl);
+          return;
+        }
+
+        // INSTANT SYNCHRONIZED TRANSITION
+        if (msg.type === 'show-slide') {
+          hideStatusOverlay();
           currentLayout = msg.layout || 'span';
           document.body.className = (currentLayout === 'tile') ? 'mode-tile' : 'mode-span';
           applyBezelGeometry(currentBezel);
@@ -165,37 +187,23 @@
             targetUrl = `http://${host}${msg.slideUrl}`;
           }
 
-          // Preload & decode image immediately into GPU memory
-          const img = new Image();
-          img.src = targetUrl;
-          if (img.decode) {
-            try { await img.decode(); } catch(e) {}
-          }
-
-          // Set the image on the background layer at Opacity: 0
-          armedLayerIndex = 1 - activeLayerIndex;
-          const armedLayer = layers[armedLayerIndex];
-
-          armedLayer.style.transition = 'none';
-          armedLayer.style.opacity = '0';
-          armedLayer.style.backgroundImage = `url('${targetUrl}')`;
-          armedLayer.style.zIndex = '3';
-          layers[activeLayerIndex].style.zIndex = '2';
-
-          void armedLayer.offsetWidth; // Force GPU layout commit
-        }
-
-        // ==========================================
-        // PHASE 2: TRIGGER TRANSITION (Real-Time Cue)
-        // ==========================================
-        if (msg.type === 'trigger-transition') {
-          hideStatusOverlay();
           const fadeDuration = parseFloat(msg.fadeDuration !== undefined ? msg.fadeDuration : 1.0);
+          preloadImage(targetUrl);
 
-          const incoming = layers[armedLayerIndex];
-          const outgoing = layers[activeLayerIndex];
+          const incomingIndex = 1 - currentLayerIndex;
+          const incoming = layers[incomingIndex];
+          const outgoing = layers[currentLayerIndex];
 
-          // Instant zero-delay CSS crossfade
+          // 1. Prepare incoming layer
+          incoming.style.transition = 'none';
+          incoming.style.opacity = '0';
+          incoming.style.backgroundImage = `url('${targetUrl}')`;
+          incoming.style.zIndex = '3';
+          outgoing.style.zIndex = '2';
+
+          void incoming.offsetWidth; // Force paint
+
+          // 2. Instant simultaneous crossfade (Image is already cached in RAM)
           const transitionCss = `opacity ${fadeDuration}s cubic-bezier(0.4, 0.0, 0.2, 1)`;
           incoming.style.transition = transitionCss;
           outgoing.style.transition = transitionCss;
@@ -203,7 +211,7 @@
           incoming.style.opacity = '1';
           outgoing.style.opacity = '0';
 
-          activeLayerIndex = armedLayerIndex;
+          currentLayerIndex = incomingIndex;
         }
 
         if (msg.type === 'blackout') {
